@@ -1,0 +1,171 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -104,6 +104,11 @@
+     if (urlArgs.readHeadings !== undefined && typeof urlArgs.readHeadings !== "boolean") {
+         return false;
+     }
++    if (urlArgs.evidenceQuery !== undefined &&
++        (typeof urlArgs.evidenceQuery !== "string" || !urlArgs.evidenceQuery.trim() || urlArgs.evidenceQuery.length > 360
++         || urlArgs.paragraphRange || urlArgs.readHeadings || urlArgs.startChar !== undefined)) {
++        return false;
++    }
+     return true;
+ }
+ function getFetchTimeoutMs(mcpServer) {
+@@ -118,14 +123,14 @@
+     }
+     return parsed;
+ }
+-function getDefaultUrlReadMaxChars(mcpServer) {
+-    const rawValue = process.env.URL_READ_MAX_CHARS;
++function getUrlReadCharLimit(mcpServer, envName) {
++    const rawValue = process.env[envName];
+     if (rawValue === undefined || rawValue.trim() === "") {
+         return undefined;
+     }
+     const parsed = parseStrictInteger(rawValue);
+     if (parsed === undefined || parsed <= 0) {
+-        logMessage(mcpServer, "warning", `Ignoring invalid URL_READ_MAX_CHARS="${rawValue}". Expected a positive integer.`);
++        logMessage(mcpServer, "warning", `Ignoring invalid ${envName}. Expected a positive integer.`);
+         return undefined;
+     }
+     return parsed;
+@@ -162,14 +167,19 @@
+ async function executeUrlRead(mcpServer, args, signal) {
+     if (!isWebUrlReadArgs(args))
+         throw new Error("Invalid arguments for URL reading");
+-    const defaultMaxLength = getDefaultUrlReadMaxChars(mcpServer);
+-    return textToolResult(await fetchAndConvertToMarkdown(mcpServer, args.url, getFetchTimeoutMs(mcpServer), {
++    const configuredDefault = getUrlReadCharLimit(mcpServer, "URL_READ_MAX_CHARS") ?? 4000;
++    const ceiling = getUrlReadCharLimit(mcpServer, "URL_READ_HARD_MAX_CHARS") ?? 12000;
++    const maxLength = Math.min(args.maxLength ?? configuredDefault, ceiling);
++    const text = await fetchAndConvertToMarkdown(mcpServer, args.url, getFetchTimeoutMs(mcpServer), {
+         startChar: args.startChar,
+-        maxLength: args.maxLength ?? defaultMaxLength,
++        maxLength,
++        evidenceQuery: args.evidenceQuery,
+         section: args.section,
+         paragraphRange: args.paragraphRange,
+         readHeadings: args.readHeadings,
+-    }, signal));
++    }, signal);
++    // Heading listings return before the reader applies its character pagination.
++    return textToolResult(text.slice(0, maxLength));
+ }
+ const TOOL_DEFINITIONS = {
+     searxng_web_search: {
+@@ -297,6 +307,7 @@
+         name: "ihor-sokoliuk/mcp-searxng",
+         version: packageVersion,
+     }, {
++        instructions: "Use retrieved sources for requested facts. If the retrieved evidence does not establish the requested fact, say it could not be verified from the retrieved text and stop. In that case leave citations empty and do not assert related facts, compatibility, or the contents of unread sections.",
+         capabilities: {
+             logging: {},
+             resources: {},
+--- a/dist/types.js
++++ b/dist/types.js
+@@ -277,7 +277,7 @@
+         "PDF text extraction is supported with bounded input, output, page count, time, concurrency, and memory; OCR is not supported. " +
+         "Binary, media, archive, and octet-stream downloads other than PDFs are intentionally rejected instead of being returned as raw bytes. " +
+         "When the operator configures browser solvers, mcp-searxng attempts FlareSolverr first and then Byparr only after a busy or transient-unavailable acquisition; cache hits bypass acquisition and a final busy or unavailable provider uses one uncached direct-fetch fallback. " +
+-        "Three modes: " +
++        "Use evidenceQuery to select relevant excerpts by question in one read. Treat excerpts as partial. If they do not establish the requested answer, briefly say the evidence is insufficient, omit citations, and do not guess or make claims about unseen text. Cite verified answers only. Other modes: " +
+         "(1) Full content — omit filtering params; use `startChar`/`maxLength` to paginate large pages. " +
+         "(2) Section extraction — set `section` to return content under a specific heading. " +
+         "(3) Headings only — set `readHeadings: true` to list all headings (mutually exclusive with other filtering params). " +
+@@ -294,6 +294,11 @@
+                 type: "string",
+                 description: "URL",
+             },
++            evidenceQuery: {
++                type: "string",
++                description: "Question or terms to select evidence. Optionally provide a section to focus on; if that heading is absent, evidence is selected across the page. May also be used with maxLength.",
++                maxLength: 360,
++            },
+             startChar: {
+                 type: "number",
+                 description: "Starting character position for content extraction (default: 0)",
+--- a/dist/url-reader.js
++++ b/dist/url-reader.js
+@@ -1,5 +1,7 @@
+ import { assertSafeOutput } from "./credential-output.js";
+ import { NodeHtmlMarkdown } from "node-html-markdown";
++import { parse } from "node-html-parser";
++import { selectEvidence } from "./evidence-select.mjs";
+ import { fetch as undiciFetch } from "undici";
+ import { createProxyAgent, createUrlReaderAgent, ProxyType } from "./proxy.js";
+ import { logMessage } from "./logging.js";
+@@ -124,6 +126,15 @@
+     return headings.join('\n');
+ }
+ function applyPaginationOptions(markdownContent, options) {
++    if (options.evidenceQuery) {
++        const section = options.section && extractSection(markdownContent, options.section);
++        if (!options.section || section)
++            return selectEvidence(section || markdownContent, options.evidenceQuery, options.maxLength);
++        const notice = "Requested section not found. These excerpts are from the whole page.\n\n";
++        if (notice.length >= options.maxLength)
++            return notice.slice(0, options.maxLength);
++        return notice + selectEvidence(markdownContent, options.evidenceQuery, options.maxLength - notice.length);
++    }
+     let result = markdownContent;
+     // Apply heading extraction first if requested
+     if (options.readHeadings) {
+@@ -685,7 +696,13 @@
+     if (type.kind === "text")
+         return renderFencedMarkdown(type.language, text);
+     try {
+-        return NodeHtmlMarkdown.translate(text);
++        const root = parse(text);
++        const main = root.querySelector('main, [role="main"]') ?? root.querySelector("article");
++        if (!main)
++            return NodeHtmlMarkdown.translate(text);
++        for (const node of main.querySelectorAll('nav, aside, footer, [role="navigation"], [role="complementary"], [role="banner"], [hidden]'))
++            node.remove();
++        return NodeHtmlMarkdown.translate(main.toString());
+     }
+     catch {
+         throw createConversionError(url);
+--- a/dist/search.js
++++ b/dist/search.js
+@@ -246,8 +246,11 @@
+     }
+ }
+ async function normalizeSearchFilters(mcpServer, categories, engines) {
++    const strict = process.env.SEARXNG_STRICT_FILTERS === "true";
+     const effectiveCategories = categories !== undefined && categories.trim() !== "" ? categories : undefined;
+     const effectiveEngines = engines !== undefined && engines.trim() !== "" ? engines : undefined;
++    if (strict && effectiveCategories && effectiveEngines)
++        throw new MCPSearXNGError("Use engines or categories, not both.");
+     if (!effectiveCategories && !effectiveEngines) {
+         return {};
+     }
+@@ -262,6 +265,9 @@
+     let knownEngines;
+     if (effectiveCategories) {
+         knownCategories = await getKnownCategories(mcpServer);
++        if (strict && (knownCategories === null || !splitCommaSeparated(effectiveCategories).length ||
++            splitCommaSeparated(effectiveCategories).some(value => !buildCanonicalLookup(knownCategories).has(value.toLowerCase()))))
++            throw new MCPSearXNGError("Cannot validate requested categories against SearXNG configuration.");
+         if (knownCategories === null) {
+             return {
+                 categories: effectiveCategories,
+@@ -273,6 +279,9 @@
+     }
+     if (effectiveEngines) {
+         knownEngines = await getKnownEngines(mcpServer);
++        if (strict && (knownEngines === null || !splitCommaSeparated(effectiveEngines).length ||
++            splitCommaSeparated(effectiveEngines).some(value => !buildCanonicalLookup(knownEngines).has(value.toLowerCase()))))
++            throw new MCPSearXNGError("Cannot validate requested engines against SearXNG configuration.");
+         if (knownEngines === null) {
+             return {
+                 categories: effectiveCategories,
+@@ -741,6 +750,8 @@
+         logMessage(mcpServer, "error", "Configuration invalid");
+         throw new MCPSearXNGError(validationError);
+     }
++    if (process.env.SEARXNG_STRICT_FILTERS === "true" && /(^|\s)!/u.test(query))
++        throw new MCPSearXNGError("Use explicit engines or categories instead of bang selectors.");
+     const filters = await normalizeSearchFilters(mcpServer, categories, engines);
+     await validateTimeRangeSupport(mcpServer, filters.engines, time_range);
+     // Build detailed log message with all parameters

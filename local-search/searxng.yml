@@ -1,0 +1,90 @@
+use_default_settings:
+  engines:
+    keep_only: ["duckduckgo", "yahoo", "freeserp", "github", "arxiv", "npm", "crates.io", "docker hub", "huggingface", "huggingface datasets", "mdn", "stackoverflow", "crossref", "pubmed"]
+plugins: {}
+general:
+  debug: false
+  instance_name: Local project search
+server:
+  limiter: false
+  public_instance: false
+  image_proxy: false
+search:
+  formats: [json]
+  max_page: 3
+  autocomplete: ''
+  suspended_times:
+    SearxEngineAccessDenied: 86400
+    SearxEngineCaptcha: 86400
+    SearxEngineTooManyRequests: 86400
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 6.0
+  retries: 0
+  max_redirects: 0
+engines:
+  - name: duckduckgo
+    disabled: false
+    enable_http3: false
+  - name: yahoo
+    disabled: false
+    enable_http3: false
+  - name: freeserp
+    engine: freeserp
+    shortcut: fsgo
+    categories: [general]
+    disabled: false
+    enable_http3: false
+  - name: "github"
+    categories: [repositories]
+    disabled: false
+    enable_http3: false
+  - name: "arxiv"
+    categories: [papers]
+    disabled: false
+    enable_http3: false
+  - name: "npm"
+    engine: json_engine
+    categories: [javascript-packages]
+    disabled: false
+    enable_http3: false
+    search_url: https://registry.npmjs.org/-/v1/search?text={query}&size=10&from={pageno}
+    paging: true
+    page_size: 10
+    first_page_num: 0
+    results_query: objects
+    url_query: package/links/npm
+    title_query: package/name
+    content_query: package/description
+  - name: "crates.io"
+    categories: [rust-crates]
+    disabled: false
+    enable_http3: false
+  - name: "docker hub"
+    categories: [container-images]
+    disabled: false
+    enable_http3: false
+  - name: "huggingface"
+    categories: [models]
+    disabled: false
+    enable_http3: false
+  - name: "huggingface datasets"
+    categories: [datasets]
+    disabled: false
+    enable_http3: false
+  - name: "mdn"
+    categories: [web-docs]
+    disabled: false
+    enable_http3: false
+  - name: "stackoverflow"
+    categories: [developer-qa]
+    disabled: false
+    enable_http3: false
+  - name: "crossref"
+    categories: [paper-records]
+    disabled: false
+    enable_http3: false
+  - name: "pubmed"
+    categories: [biomed-index]
+    disabled: false
+    enable_http3: false

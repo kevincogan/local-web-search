@@ -1,0 +1,47 @@
+{
+  "preferred": [
+    "duckduckgo",
+    "yahoo",
+    "freeserp"
+  ],
+  "sources": {
+    "duckduckgo": {
+      "min_interval_ms": 30000
+    },
+    "yahoo": {
+      "min_interval_ms": 30000
+    },
+    "freeserp": {
+      "min_interval_ms": 30000
+    }
+  },
+  "specialists": {
+    "repositories": "github",
+    "papers": "arxiv",
+    "javascript-packages": "npm",
+    "rust-crates": "crates.io",
+    "container-images": "docker hub",
+    "models": "huggingface",
+    "datasets": "huggingface datasets",
+    "web-docs": "mdn",
+    "developer-qa": "stackoverflow",
+    "paper-records": "crossref",
+    "biomed-index": "pubmed"
+  },
+  "specialist_intervals_ms": {
+    "github": 3000,
+    "arxiv": 3000,
+    "npm": 3000,
+    "crates.io": 3000,
+    "docker hub": 3000,
+    "huggingface": 3000,
+    "huggingface datasets": 3000,
+    "mdn": 3000,
+    "stackoverflow": 5000,
+    "crossref": 3000,
+    "pubmed": 5000
+  },
+  "attempt_ms": 3500,
+  "throttle_ms": 86400000,
+  "adaptive": true
+}

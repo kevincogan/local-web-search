@@ -1,0 +1,837 @@
+--- a/dist/search.js
++++ b/dist/search.js
+@@ -1,4 +1,5 @@
+ import { parse } from "node-html-parser";
++import { automaticSearch, nextEligibleGeneralSource, planSearch, searchInOrder, shareSearch } from "./engine-routing.mjs";
+ import { getEngineTimeRangeSupport, getKnownCategories, getKnownEngines } from "./instance-info.js";
+ import { applySearchRequestConfig, fetchSearxng } from "./proxy.js";
+ import { logMessage } from "./logging.js";
+@@ -465,6 +466,7 @@
+         ["q", request.query],
+         ["format", "json"],
+         ["pageno", request.pageno.toString()],
++        ["timeout_limit", request.engineTimeout],
+         ["time_range", normalizeTimeRangeParam(request.time_range)],
+         ["language", normalizeLanguageParam(request.effectiveLanguage)],
+         ["safesearch", normalizeSafesearchParam(request.effectiveSafesearch)],
+@@ -733,7 +735,7 @@
+         failedPages,
+     };
+ }
+-export async function performWebSearch(mcpServer, query, pageno = 1, time_range, language, safesearch, min_score, num_results, categories, engines, response_format, result_detail = "full", pages = 1) {
++export async function performWebSearch(mcpServer, query, pageno = 1, time_range, language, safesearch, min_score, num_results, categories, engines, response_format, result_detail = "full", pages = 1, refresh = false, deadline = 0) {
+     // The tool schema rejects out-of-range input; retain a defensive internal cap.
+     const pageCount = Number.isInteger(pages) && pages > 0 ? Math.min(pages, 5) : 1;
+     const startTime = Date.now();
+@@ -753,6 +755,8 @@
+     if (process.env.SEARXNG_STRICT_FILTERS === "true" && /(^|\s)!/u.test(query))
+         throw new MCPSearXNGError("Use explicit engines or categories instead of bang selectors.");
+     const filters = await normalizeSearchFilters(mcpServer, categories, engines);
++    const automated = automaticSearch(filters);
++    const route = planSearch(filters, pageno, pageCount, time_range, query);
+     await validateTimeRangeSupport(mcpServer, filters.engines, time_range);
+     // Build detailed log message with all parameters
+     const searchParams = [
+@@ -765,7 +769,8 @@
+         filters.categories ? `categories: ${filters.categories}` : null,
+         filters.engines ? `engines: ${filters.engines}` : null,
+     ].filter(Boolean).join(", ");
+-    logMessage(mcpServer, "info", `Starting web search: "${query}" (${searchParams})`);
++    logMessage(mcpServer, "info", `Starting web search (${searchParams})`);
+-    const SEARCH_TIMEOUT_MS = getSearchTimeoutMs(mcpServer);
++    const configuredTimeout = getSearchTimeoutMs(mcpServer);
++    const SEARCH_TIMEOUT_MS = deadline ? Math.max(1, Math.min(configuredTimeout, Math.floor(deadline - performance.now()))) : configuredTimeout;
+     const responseMaxBytes = resolveSearxngResponseMaxBytes(mcpServer);
+     const instances = getSearxngInstances();
+@@ -797,11 +801,30 @@
+         instances,
+         searxngFanout: fanoutEnabled,
+     };
+-    const cachedResult = searchCache.get("searxng_web_search", cacheArgs);
++    const cachedResult = automated || refresh ? null : searchCache.get("searxng_web_search", cacheArgs);
+     if (cachedResult !== null) {
+         return formatCachedSearchResult(cachedResult, effectiveResponseFormat, result_detail);
+     }
+-    const pageResult = await fetchSearchPages(mcpServer, instances, request, fanoutEnabled, pageCount);
++    if (route && (instances.length !== 1 || fanoutEnabled || isHtmlFallbackEnabled()))
++        throw new MCPSearXNGError("The project search route requires one JSON-only SearXNG instance.");
++    const routed = (budget = SEARCH_TIMEOUT_MS) => searchInOrder(route, budget, min_score, query, async (engine, timeoutMs, searchQuery) => {
++            const { data } = await fetchSearchFromInstance(mcpServer, instances[0], {
++                ...request, query: searchQuery, filters: { engines: engine }, timeoutMs,
++                engineTimeout: Math.max(.1, (timeoutMs - 75) / 1000).toFixed(3),
++            });
++            return data;
++        }, filters.engines && result_detail === "full"
++            // Explicit specialist lookups can return evidence only in an infobox.
++            ? data => formatInfoboxes(data.infoboxes) !== ""
++            : undefined, automated);
++    const pageResult = route
++        ? await (automated ? shareSearch(cacheArgs, route, routed, refresh, SEARCH_TIMEOUT_MS) : routed())
++        : await fetchSearchPages(mcpServer, instances, request, fanoutEnabled, pageCount);
+     let data = pageResult.data;
++    // Cache search leads, and check fallback availability against current shared state.
++    const nextEngine = automated && data.results.length && nextEligibleGeneralSource(route, data.engine_attempts);
++    if (nextEngine) {
++        data = { ...data, search_assessment: { ...data.search_assessment, next_engine: nextEngine } };
++    }
+     const { servedBy, hasCleanEmptyResponse, failedPages } = pageResult;
+     const pageFailureNote = failedPages.length ? `Search pages unavailable: ${failedPages.join(", ")}. Results may be incomplete.` : "";
+@@ -811,7 +829,8 @@
+         data = { ...data, unresponsive_engines: engineFailures };
+     const metadata = result_detail === "full" ? formatSearchMetadata(data) : "";
+     const failureDetails = engineFailures.map(([engine, reason]) => reason ? `${engine} (${reason})` : engine).join(", ");
+-    if (data.results.length === 0 && engineFailures.length > 0 && !hasCleanEmptyResponse && !metadata) {
++    const structuredOutage = effectiveResponseFormat === "json" && data.search_assessment?.evidence_state === "provider_unavailable";
++    if (data.results.length === 0 && engineFailures.length > 0 && !hasCleanEmptyResponse && !metadata && !structuredOutage) {
+         const error = createDegradedSearchError(query, failureDetails);
+         assertSafeOutput(error.message);
+         throw error;
+@@ -831,7 +850,7 @@
+         if (result_detail === "full")
+             assertSafeOutput(JSON.stringify({ ...data, results: slicedResults }));
+         const result = result_detail === "compact"
+-            ? JSON.stringify({ results: compactJsonResults(slicedResults, maxResultChars), ...(engineFailures.length ? { unresponsive_engines: engineFailures } : {}), ...(failedPages.length ? { failedPages } : {}) }, null, 2)
++            ? JSON.stringify({ results: compactJsonResults(slicedResults, maxResultChars), ...(engineFailures.length ? { unresponsive_engines: engineFailures } : {}), ...(data.engine_attempts ? { engine_attempts: data.engine_attempts } : {}), ...(data.search_assessment ? { search_assessment: data.search_assessment } : {}), ...(data.search_cache ? { search_cache: data.search_cache } : {}), ...(failedPages.length ? { failedPages } : {}) }, null, 2)
+             : JSON.stringify({
+                 ...data,
+                 results: truncateSearchResults(slicedResults, maxResultChars),
+@@ -840,12 +859,15 @@
+                 ...(includeProvenance ? { servedBy: redactedServedBy } : {}),
+             }, null, 2);
+         assertSafeOutput(result);
+-        if (slicedResults.length > 0 && !failedPages.length) {
++        if (!automated && slicedResults.length > 0 && !failedPages.length) {
+             searchCache.set("searxng_web_search", cacheArgs, result);
+         }
+         return result;
+     }
+     const leadingSections = [
++        data.search_assessment ? `Search: ${data.search_assessment.status.replaceAll("_", " ")}. Publisher pages have not been verified.` : null,
++        data.search_assessment?.publisher_index ? `Publisher index: ${data.search_assessment.publisher_index}` : null,
++        data.search_cache ? `Cached search leads, retrieved ${data.search_cache.retrieved_at}.` : null,
+         includeProvenance
+             ? `Served by SearXNG ${redactedServedBy.length === 1 ? "instance" : "instances"}: ${redactedServedBy.join(", ")}`
+             : null,
+@@ -859,7 +881,7 @@
+             effectiveMax === undefined ? null : `num_results=${effectiveMax}`,
+         ].filter(Boolean).join(" ");
+         const filterNote = appliedFilters ? ` after applying ${appliedFilters}` : "";
+-        logMessage(mcpServer, "info", `No results found for query: "${query}"${filterNote}`);
++        logMessage(mcpServer, "info", `No results found${filterNote}`);
+         const noResultsMessage = createNoResultsMessage(query);
+         const emptyOutput = result_detail === "compact" ? noResultsMessage : (leadingSections ? `${leadingSections}\n\n---\n\n${noResultsMessage}` : noResultsMessage);
+         const result = [emptyOutput, failureNote, pageFailureNote].filter(Boolean).join("\n\n");
+@@ -867,7 +889,7 @@
+         return result;
+     }
+     const duration = Date.now() - startTime;
+-    logMessage(mcpServer, "info", `Search completed: "${query}" (${searchParams}) - ${slicedResults.length} results in ${duration}ms`);
++    logMessage(mcpServer, "info", `Search completed (${searchParams}) - ${slicedResults.length} results in ${duration}ms`);
+     const formattedResults = result_detail === "compact"
+         ? formatCompactTextResults(slicedResults, maxResultChars)
+         : slicedResults
+@@ -905,10 +927,10 @@
+             return lines.join("\n");
+         })
+             .join("\n\n");
+-    const textOutput = result_detail === "compact" ? formattedResults : (leadingSections ? `${leadingSections}\n\n---\n\n${formattedResults}` : formattedResults);
++    const textOutput = result_detail === "compact" && !automated ? formattedResults : (leadingSections ? `${leadingSections}\n\n---\n\n${formattedResults}` : formattedResults);
+     const result = [textOutput, failureNote, pageFailureNote].filter(Boolean).join("\n\n");
+     assertSafeOutput(result);
+-    if (!failedPages.length)
++    if (!automated && !failedPages.length)
+         searchCache.set("searxng_web_search", cacheArgs, result);
+     return result;
+ }
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -3,7 +3,9 @@
+ // Import modularized functionality
+ import { WEB_SEARCH_TOOL, SUGGESTIONS_TOOL, INSTANCE_INFO_TOOL, READ_URL_TOOL, LITE_WEB_SEARCH_TOOL, LITE_SUGGESTIONS_TOOL, LITE_INSTANCE_INFO_TOOL, LITE_READ_URL_TOOL, isSearXNGWebSearchArgs, isSearXNGSearchSuggestionsArgs, isSearXNGInstanceInfoArgs, } from "./types.js";
+ import { logMessage, markModernServer, runWithModernLog, setLogLevel } from "./logging.js";
+-import { performWebSearch } from "./search.js";
++import { getSearchTimeoutMs, performWebSearch } from "./search.js";
++import { classifySearch } from "./engine-routing.mjs";
++import { advisoryIndex, bundlePublisherEvidence, datedAdvisoryLeads, exactTechnicalRecord, githubDocsLeads, httpxDocsLeads, ietfLeads, ociSourceMarkdown, postgresSqlLead, pythonInventoryLead } from "./evidence-bundle.mjs";
+ import { HF_CATALOG_TOOL, validCatalogArgs, readHuggingFaceCatalog } from "./huggingface-catalog.mjs";
+ import { performSearchSuggestions } from "./suggestions.js";
+ import { checkStartupCapabilities, fetchInstanceInfo } from "./instance-info.js";
+@@ -84,6 +86,11 @@
+         return false;
+     }
+     const urlArgs = args;
++    if (urlArgs.responseFormat !== undefined &&
++        (urlArgs.responseFormat !== "evidence" || urlArgs.url.length > 2048 ||
++         urlArgs.readHeadings || urlArgs.paragraphRange || urlArgs.startChar !== undefined)) {
++        return false;
++    }
+     // Convert empty strings to undefined for optional string parameters
+     if (urlArgs.section === "")
+         urlArgs.section = undefined;
+@@ -149,10 +156,127 @@
+         throw new ProtocolError(ProtocolErrorCode.InvalidParams, sanitizeDiagnosticText(`Unknown tool: ${name}`));
+     return definition.validate(args) ? undefined : definition.invalidArguments;
+ }
+-async function executeWebSearch(mcpServer, args) {
++function documentationLeads(data, leads, limit) {
++    const urls = new Set(leads.map(lead => lead.url));
++    const results = [...leads, ...data.results.filter(hit => !urls.has(hit.url))].slice(0, limit);
++    return textToolResult(JSON.stringify({ ...data, results, search_assessment: {
++        ...data.search_assessment, status: "relevant_leads", evidence_state: "candidate_leads",
++        publisher_index: leads[0].source_index, publisher_pages_verified: false,
++    }, publisher_evidence: {
++        state: "candidate_leads", publisher_url: leads[0].source_index,
++        detail: "The publisher index identifies documentation sections. Open the original record before citing its facts.",
++    } }));
++}
++async function executeWebSearch(mcpServer, args, signal) {
+     if (!isSearXNGWebSearchArgs(args))
+         throw new Error("Invalid arguments for web search");
+-    return textToolResult(await performWebSearch(mcpServer, args.query, args.pageno, args.time_range, args.language, args.safesearch === undefined ? undefined : Number(args.safesearch), args.min_score, args.num_results, args.categories, args.engines, args.response_format, args.result_detail, args.pages));
++    const bundled = args.include_evidence === true;
++    const deadline = bundled ? performance.now() + getSearchTimeoutMs(mcpServer) : 0;
++    const intent = bundled ? classifySearch(args.query) : null;
++    if (intent?.explicitDates && !intent.dateWindow) {
++        return textToolResult(JSON.stringify({
++            results: [], engine_attempts: [],
++            publisher_evidence: { state: "insufficient_evidence", detail: "Provide a valid date range that starts on or before today." },
++        }));
++    }
++    const allowCatalogue = bundled && !args.engines && (!args.categories || args.categories === "general") &&
++        !args.time_range && !args.refresh && (args.min_score ?? 0) <= 1 && (args.pageno ?? 1) === 1 && (args.pages ?? 1) === 1;
++    const englishCatalogue = allowCatalogue && (!args.language || /^all$|^en(?:-|$)/iu.test(args.language));
++    const direct = allowCatalogue && exactTechnicalRecord(args.query, intent);
++    let directFailure;
++    if (direct) {
++        const read = await executeUrlRead(mcpServer, { url: direct.url, evidenceQuery: args.query.slice(0, 360),
++            responseFormat: "evidence", maxLength: 2400 }, signal, {
++            allowDestination: url => url.href === direct.url,
++            timeout: Math.max(1, Math.min(2500, Math.floor(deadline - performance.now()))),
++        });
++        const packet = JSON.parse(read.content[0].text);
++        if (packet.state === "publisher_excerpt") {
++            const results = [{ ...direct, score: 1, engines: [], content: "" }];
++            return textToolResult(JSON.stringify({ results, engine_attempts: [], publisher_evidence: packet }));
++        }
++        directFailure = packet;
++    }
++    if (englishCatalogue && !directFailure) {
++        const standards = await ietfLeads(args.query, intent, Math.floor(deadline - performance.now()), signal);
++        if (standards.length)
++            return documentationLeads({ results: [], engine_attempts: [], search_assessment: { intent: intent.category } }, standards, args.num_results ?? 5);
++        const sql = await postgresSqlLead(args.query, intent, Math.floor(deadline - performance.now()), signal);
++        if (sql)
++            return documentationLeads({ results: [], engine_attempts: [], search_assessment: { intent: intent.category } }, [sql], args.num_results ?? 5);
++        const github = await githubDocsLeads(args.query, intent, Math.floor(deadline - performance.now()), signal);
++        if (github.length)
++            return documentationLeads({ results: [], engine_attempts: [], search_assessment: { intent: intent.category } }, github, args.num_results ?? 5);
++        const leads = await httpxDocsLeads(args.query, intent, Math.floor(deadline - performance.now()), signal);
++        if (leads.length)
++            return documentationLeads({ results: [], engine_attempts: [], search_assessment: { intent: intent.category } }, leads, args.num_results ?? 5);
++    }
++    const result = await performWebSearch(mcpServer, args.query, args.pageno, args.time_range, args.language, args.safesearch === undefined ? undefined : Number(args.safesearch), args.min_score, args.num_results, args.categories, args.engines, bundled ? "json" : args.response_format, args.result_detail, args.pages, args.refresh, deadline);
++    if (!bundled)
++        return textToolResult(result);
++    const data = JSON.parse(result);
++    if (directFailure) {
++        return textToolResult(JSON.stringify({ ...data, direct_record: directFailure,
++            publisher_evidence: data.results.length ? { state: "candidate_leads", detail: "Search leads need an original record read." } : directFailure }));
++    }
++    const remaining = Math.floor(deadline - performance.now());
++    if (englishCatalogue && data.search_assessment?.intent === "known-site" && data.search_assessment.status !== "relevant_leads") {
++        const symbol = await pythonInventoryLead(args.query, intent, remaining, signal);
++        if (symbol) return documentationLeads(data, [symbol], args.num_results ?? 5);
++    }
++    const index = allowCatalogue && advisoryIndex(intent, args.query);
++    if (index && remaining >= 500 && data.search_assessment?.status !== "relevant_leads") {
++        const packet = index.fetchLeads ? await index.fetchLeads(remaining, signal)
++            : JSON.parse((await executeUrlRead(mcpServer, { url: index.url, responseFormat: "evidence", maxLength: 12000 }, signal, {
++            allowDestination: url => url.href === index.url,
++            timeout: remaining,
++        })).content[0].text);
++        if (packet.excerpt && index.selectExcerpt) {
++            const excerpt = index.selectExcerpt(packet.excerpt, intent.dateWindow, index.version);
++            if (excerpt) {
++                const release = { url: index.url, title: index.title, content: "", engines: [], score: 1 };
++                return textToolResult(JSON.stringify({ ...data, results: [release, ...data.results.filter(hit => hit.url !== index.url)].slice(0, args.num_results ?? 5),
++                    search_assessment: { ...data.search_assessment, status: "relevant_leads", evidence_state: "publisher_excerpt",
++                        publisher_pages_verified: true, publication_date_verified: false },
++                    publisher_evidence: { ...packet, excerpt } }));
++            }
++        }
++        const leads = packet.leads ?? (packet.excerpt && !index.selectExcerpt ? datedAdvisoryLeads(packet.excerpt, index, intent.dateWindow) : []);
++        if (leads.length) {
++            const seen = new Set(leads.map(lead => lead.url));
++            const results = [...leads, ...data.results.filter(hit => !seen.has(hit.url))].slice(0, args.num_results ?? 5);
++            return textToolResult(JSON.stringify({ ...data, results, search_assessment: {
++                ...data.search_assessment,
++                intent: "fresh",
++                status: "relevant_leads",
++                evidence_state: "candidate_leads",
++                publisher_index: index.url,
++                publisher_pages_verified: false,
++                publication_date_verified: false,
++            }, publisher_evidence: {
++                state: "candidate_leads",
++                publisher_url: index.url,
++                detail: index.leadDetail ?? "These dates are from the publisher index. Open an original record before citing its facts.",
++            } }));
++        }
++        return textToolResult(JSON.stringify({ ...data, publisher_evidence: {
++            state: packet.state === "publisher_excerpt" ? "insufficient_evidence" : packet.state,
++            publisher_url: index.url,
++            detail: "The bounded index read did not provide a matching publisher record.",
++        } }));
++    }
++    const publisher = await bundlePublisherEvidence(data, intent, remaining, async (url, allowDestination, readContents) => {
++        const readTime = Math.floor(deadline - performance.now());
++        if (readContents === "oci-source")
++            return ociSourceMarkdown(url, args.query, readTime, signal);
++        const read = await executeUrlRead(mcpServer, {
++            url, responseFormat: "evidence", maxLength: readContents ? 10000 : 2400,
++            ...(readContents ? {} : { evidenceQuery: (intent.site ? args.query.trim().replace(/^site:\S+\s*/iu, "") : args.query).slice(0, 360) }),
++        }, signal, { allowDestination, timeout: Math.max(1, readTime) });
++        return JSON.parse(read.content[0].text);
++    }, englishCatalogue ? args.query : "");
++    if (publisher.leads?.length) return documentationLeads(data, publisher.leads, args.num_results ?? 5);
++    return textToolResult(JSON.stringify({ ...data, publisher_evidence: publisher }));
+ }
+ async function executeSuggestions(mcpServer, args) {
+     if (!isSearXNGSearchSuggestionsArgs(args))
+@@ -165,22 +262,47 @@
+         throw new Error("Invalid arguments for instance info");
+     return textToolResult(await fetchInstanceInfo(mcpServer, args.includeEngines, args.includeDisabled, args.category, args.refresh));
+ }
+-async function executeUrlRead(mcpServer, args, signal) {
++async function executeUrlRead(mcpServer, args, signal, constraints = {}) {
+     if (!isWebUrlReadArgs(args))
+         throw new Error("Invalid arguments for URL reading");
+     const configuredDefault = getUrlReadCharLimit(mcpServer, "URL_READ_MAX_CHARS") ?? 4000;
+     const ceiling = getUrlReadCharLimit(mcpServer, "URL_READ_HARD_MAX_CHARS") ?? 12000;
+     const maxLength = Math.min(args.maxLength ?? configuredDefault, ceiling);
+-    const text = await fetchAndConvertToMarkdown(mcpServer, args.url, getFetchTimeoutMs(mcpServer), {
+-        startChar: args.startChar,
+-        maxLength,
+-        evidenceQuery: args.evidenceQuery,
+-        section: args.section,
+-        paragraphRange: args.paragraphRange,
+-        readHeadings: args.readHeadings,
+-    }, signal);
++    const evidence = args.responseFormat === "evidence" ? {
++        state: "publisher_unavailable",
++        publication_date: null,
++        whole_document_reviewed: false,
++    } : undefined;
++    let text;
++    try {
++        const timeout = Math.min(getFetchTimeoutMs(mcpServer), constraints.timeout ?? Infinity);
++        text = await fetchAndConvertToMarkdown(mcpServer, args.url, timeout, {
++            startChar: args.startChar,
++            maxLength,
++            evidenceQuery: args.evidenceQuery,
++            section: args.section,
++            paragraphRange: args.paragraphRange,
++            readHeadings: args.readHeadings,
++            evidence,
++            allowDestination: constraints.allowDestination,
++        }, signal);
++    } catch (error) {
++        signal?.throwIfAborted();
++        if (!evidence || error?.name !== "MCPSearXNGError")
++            throw error;
++        const detail = evidence.state === "source_not_found"
++            ? "The publisher reported that this address was missing."
++            : "The requested page could not be read.";
++        return errorToolResult(JSON.stringify({ ...evidence, detail }));
++    }
+     // Heading listings return before the reader applies its character pagination.
+-    return textToolResult(text.slice(0, maxLength));
++    text = text.slice(0, maxLength);
++    if (evidence) {
++        evidence[evidence.state === "publisher_excerpt" ? "excerpt" : "detail"] = text;
++        return evidence.state === "publisher_unavailable"
++            ? errorToolResult(JSON.stringify(evidence)) : textToolResult(JSON.stringify(evidence));
++    }
++    return textToolResult(text);
+ }
+ const TOOL_DEFINITIONS = {
+     huggingface_catalog: {
+@@ -197,10 +326,52 @@
+         execute: executeUrlRead,
+     },
+ };
++// A single-task profile may reserve one read for a URL it actually observed.
++// Interactive sessions retain direct reading and can span unrelated questions.
++const groundedReads = process.env.OSWS_GROUNDED_READS === "1" ? {
++    leads: new Set(),
++    searches: 0,
++    read: false,
++    firstSearch: null,
++    nextEngine: null,
++} : null;
++async function executeGroundedTool(mcpServer, name, definition, args, signal) {
++    if (name === "web_url_read") {
++        if (groundedReads.read || !groundedReads.leads.has(args.url))
++            return errorToolResult("Read one exact URL returned by search. If the read was used, report the evidence gap.");
++        groundedReads.read = true;
++        return definition.execute(mcpServer, { ...args, responseFormat: "evidence" }, signal);
++    }
++    if (name !== "searxng_web_search")
++        return definition.execute(mcpServer, args, signal);
++    if (groundedReads.read || groundedReads.searches >= 2)
++        return errorToolResult("Search allowance exhausted. Answer from the verified excerpt or report the evidence gap.");
++    const first = groundedReads.searches === 0;
++    if (!first && (!groundedReads.nextEngine || args.engines !== groundedReads.nextEngine))
++        return errorToolResult("Use the next eligible engine returned by the first search, or use an existing lead.");
++    if (first)
++        groundedReads.firstSearch = { ...args, pageno: 1, pages: 1 };
++    const search = first ? groundedReads.firstSearch : {
++        ...groundedReads.firstSearch, engines: groundedReads.nextEngine, categories: undefined,
++    };
++    groundedReads.searches++;
++    const result = await definition.execute(mcpServer, {
++        ...search, response_format: "json", result_detail: "compact", include_evidence: false, num_results: 5,
++    }, signal);
++    if (!result.isError) {
++        const data = JSON.parse(result.content[0].text);
++        groundedReads.nextEngine = data.search_assessment?.next_engine ?? null;
++        for (const {url} of data.results ?? [])
++            groundedReads.leads.add(url);
++    }
++    return result;
++}
+ async function executeTool(mcpServer, name, args, signal) {
+     const definition = TOOL_DEFINITIONS[name];
+     if (!definition)
+         throw new ProtocolError(ProtocolErrorCode.InvalidParams, sanitizeDiagnosticText(`Unknown tool: ${name}`));
++    if (groundedReads)
++        return executeGroundedTool(mcpServer, name, definition, args, signal);
+     return definition.execute(mcpServer, args, signal);
+ }
+ function registerMcpTools(mcpServer, modern, callTool) {
+--- a/dist/types.js
++++ b/dist/types.js
+@@ -10,6 +10,9 @@
+         return false;
+     }
+     const searchArgs = args;
++    if (searchArgs.include_evidence !== undefined && typeof searchArgs.include_evidence !== "boolean") {
++        return false;
++    }
+     if (searchArgs.pageno !== undefined &&
+         (typeof searchArgs.pageno !== "number" || !Number.isInteger(searchArgs.pageno) || searchArgs.pageno < 1)) {
+         return false;
+@@ -41,6 +44,9 @@
+             Number.isNaN(searchArgs.min_score) ||
+             searchArgs.min_score < 0 ||
+             searchArgs.min_score > 1)) {
++        return false;
++    }
++    if (searchArgs.refresh !== undefined && typeof searchArgs.refresh !== "boolean") {
+         return false;
+     }
+     if (searchArgs.num_results !== undefined &&
+@@ -148,6 +154,14 @@
+                 description: "Minimum relevance score threshold from 0.0 to 1.0. Results below this score are filtered out.",
+                 minimum: 0,
+                 maximum: 1,
++            },
++            refresh: {
++                type: "boolean",
++                description: "Bypass cached search leads. Local provider budgets and pauses still apply.",
++            },
++            include_evidence: {
++                type: "boolean",
++                description: "Return JSON search leads with one focused original documentation excerpt when available. Uses the same overall deadline. Omit for link-only requests.",
+             },
+             num_results: {
+                 type: "number",
+@@ -294,6 +308,11 @@
+                 type: "string",
+                 description: "URL",
+             },
++            responseFormat: {
++                type: "string",
++                enum: ["evidence"],
++                description: "Return a compact evidence packet with the fetched publisher URL, observed publication date if available, excerpt, and read state. Limits apply to the excerpt. An excerpt verifies only facts it directly supports.",
++            },
+             evidenceQuery: {
+                 type: "string",
+                 description: "Question or terms to select evidence. Optionally provide a section to focus on; if that heading is absent, evidence is selected across the page. May also be used with maxLength.",
+--- a/dist/url-reader.js
++++ b/dist/url-reader.js
+@@ -1,7 +1,8 @@
+ import { assertSafeOutput } from "./credential-output.js";
++import { curlAdvisoryWindow, pauseProjectSource, reserveProjectSource, retryAfter } from "./engine-routing.mjs";
+ import { NodeHtmlMarkdown } from "node-html-markdown";
+ import { parse } from "node-html-parser";
+-import { selectEvidence } from "./evidence-select.mjs";
++import { datedCurlAdvisoryExcerpt, labelledPublicationDate, selectEvidence } from "./evidence-select.mjs";
+ import { fetch as undiciFetch } from "undici";
+ import { createProxyAgent, createUrlReaderAgent, ProxyType } from "./proxy.js";
+ import { logMessage } from "./logging.js";
+@@ -31,6 +32,7 @@
+     ["application/toml", (mediaType) => ({ kind: "text", mediaType, language: "toml" })],
+     ["application/x-toml", (mediaType) => ({ kind: "text", mediaType, language: "toml" })],
+     ["text/toml", (mediaType) => ({ kind: "text", mediaType, language: "toml" })],
++    ["text/markdown", (mediaType) => ({ kind: "text", mediaType, language: "markdown" })],
+ ]);
+ const EXACT_BINARY_CONTENT_TYPES = new Set([
+     "application/octet-stream",
+@@ -63,13 +65,14 @@
+ }
+ function extractSection(markdownContent, sectionHeading) {
+     const lines = markdownContent.split('\n');
+-    const normalizedHeading = sectionHeading.toLowerCase();
++    const normalize = heading => heading.replace(/\\([.])/gu, "$1").toLowerCase();
++    const normalizedHeading = normalize(sectionHeading);
+     let startIndex = -1;
+     let currentLevel = 0;
+     // Find the section start — string match avoids RegExp constructor with user input
+     for (let i = 0; i < lines.length; i++) {
+         const line = lines[i];
+-        if (/^#{1,6}\s/.test(line) && line.toLowerCase().includes(normalizedHeading)) {
++        if (/^#{1,6}\s/.test(line) && normalize(line).includes(normalizedHeading)) {
+             startIndex = i;
+             currentLevel = (line.match(/^#+/) || [''])[0].length;
+             break;
+@@ -128,6 +131,8 @@
+ function applyPaginationOptions(markdownContent, options) {
+     if (options.evidenceQuery) {
+         const section = options.section && extractSection(markdownContent, options.section);
++        if (options.evidence && options.section)
++            options.evidence.requested_section_found = Boolean(section);
+         if (!options.section || section)
+             return selectEvidence(section || markdownContent, options.evidenceQuery, options.maxLength);
+         const notice = "Requested section not found. These excerpts are from the whole page.\n\n";
+@@ -192,7 +197,7 @@
+         if (isUrlSecurityPolicyDnsError(error)) {
+             throw createURLSecurityPolicyError(url);
+         }
+-        logMessage(mcpServer, "warning", `HEAD check failed (proceeding with GET): ${error.message}`);
++        logMessage(mcpServer, "warning", "HEAD check failed (proceeding with GET).");
+         return null;
+     }
+     finally {
+@@ -436,37 +441,132 @@
+ function isRetryableReplayError(error, timedOut) {
+     return timedOut || ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT']
+         .includes(error?.cause?.code ?? error?.code);
++}
++function gnuPublisher(url) {
++    return url.hostname === "gnu.org" || url.hostname === "www.gnu.org";
++}
++export function publisherArticleRoute(url, options) {
++    if (url.username || url.password || url.search || url.hash) return null;
++    if (url.origin === "https://docs.github.com" && /^\/en\/(?:[a-z0-9_-]+\/)+[a-z0-9_-]+$/u.test(url.pathname)) {
++        const address = new URL("/api/article/body", url.origin);
++        address.searchParams.set("pathname", url.pathname);
++        return {address, key: "github-docs-article", mediaType: "text/markdown"};
++    }
++    if (url.origin !== "https://docs.redhat.com" || options.readHeadings ||
++        options.paragraphRange || options.startChar !== undefined) return null;
++    const section = "About security context constraints";
++    const topic = options.evidenceQuery?.trim().replace(/^site:docs\.redhat\.com\s+/iu, "");
++    if (options.section ? options.section.toLowerCase() !== section.toLowerCase() :
++        !/^(?:(?:what (?:are|is)|explain|define|describe)\s+)?(?:openshift\s+)?(?:security context constraints?|sccs?)(?:\s+in\s+openshift(?:\s+container platform)?)?\??$/iu.test(topic ?? "")) return null;
++    const version = /^\/en\/documentation\/openshift_container_platform\/(\d{1,2}\.\d{1,2})\/html\/authentication_and_authorization\/managing-pod-security-policies\/?$/u.exec(url.pathname)?.[1];
++    if (!version) return null;
++    const address = new URL(`https://raw.githubusercontent.com/openshift/openshift-docs/enterprise-${version}/modules/security-context-constraints-about.adoc`);
++    return {address, key: "openshift-docs-source", mediaType: "text/plain", section};
+ }
++export async function fetchBoundedPublicBytes(url, maxBytes, timeoutMs, signal) {
++    assertUrlAllowed(new URL(url));
++    const timeout = AbortSignal.timeout(timeoutMs);
++    const response = await undiciFetch(url, {
++        redirect: "manual",
++        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
++        dispatcher: createUrlReaderAgent(),
++        headers: { "User-Agent": "open-source-web-search/1.0" },
++    });
++    const challenged = response.headers.get("cf-mitigated") === "challenge";
++    if (!response.ok || challenged) {
++        await cancelResponseBody(response);
++        return { bytes: null, status: response.status, challenged, retry: response.headers.get("retry-after") };
++    }
++    const result = await readResponseBytesWithLimit(response, maxBytes);
++    const mediaType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
++    return { bytes: result.exceeded ? null : result.bytes, status: response.status, challenged: false, mediaType };
++}
++async function readPublisherArticle(url, route, options, maxBytes, timeoutMs, signal) {
++    const {address, key, mediaType, section} = route;
++    const cacheKey = `${key}:${url.href}`;
++    signal?.throwIfAborted();
++    const cached = urlCache.get(cacheKey);
++    if (cached) {
++        assertSafeOutput(cached.markdownContent);
++        return selectReadOutput(cached.markdownContent, options, cached.evidenceSource, true);
++    }
++    const unavailable = reserveProjectSource(key, timeoutMs);
++    if (unavailable === "no project request budget") return null;
++    if (unavailable) throw createContentError("Publisher source request budget is unavailable.", url.href);
++    let response;
++    try {
++        response = await fetchBoundedPublicBytes(address.href, maxBytes, timeoutMs, signal);
++    }
++    catch {
++        signal?.throwIfAborted();
++        throw createContentError("The publisher's text source could not be read.", url.href);
++    }
++    if (response.challenged) pauseProjectSource(key, "CAPTCHA");
++    else if (response.status === 401 || response.status === 403) pauseProjectSource(key, "access denied");
++    else if (response.status === 429) pauseProjectSource(key, "throttled", retryAfter(response.retry));
++    if (section && !response.challenged && (response.status === 404 || response.status === 410)) return null;
++    if (response.status !== 200) options.evidence.http_status = response.status;
++    if (response.status !== 200 || response.challenged || response.mediaType !== mediaType || !response.bytes)
++        throw createContentError("The publisher did not return bounded text.", url.href);
++    let markdown = new TextDecoder().decode(response.bytes);
++    if (!markdown.trim() || markdown.includes("\0"))
++        throw createContentError("The publisher returned empty or binary content.", url.href);
++    if (section) {
++        if (!markdown.split("\n").includes(`= ${section}`))
++            throw createContentError("The publisher source did not contain the expected section.", url.href);
++        markdown = markdown.replace(/^(={1,6}) (?=\S)/gmu, (_, heading) => "#".repeat(heading.length) + " ");
++    }
++    signal?.throwIfAborted();
++    assertSafeOutput(markdown);
++    const source = { publisher_url: url.href, retrieved_from: address.href, retrieved_at: new Date().toISOString(),
++        ...(section && {publisher_section: section}) };
++    urlCache.set(cacheKey, markdown, source);
++    return selectReadOutput(markdown, options, source, false);
++}
+ export async function fetchAndConvertToMarkdown(mcpServer, url, timeoutMs = 10000, paginationOptions = {}, signal) {
+     const startTime = Date.now();
+-    logMessage(mcpServer, "info", `Fetching URL: ${url}`);
++    logMessage(mcpServer, "info", "Fetching public URL.");
+     // Validate URL format
+     let parsedUrl;
+     try {
+         parsedUrl = new URL(url);
+     }
+     catch (error) {
+-        logMessage(mcpServer, "error", `Invalid URL format: ${url}`);
++        logMessage(mcpServer, "error", "Rejected invalid URL format.");
+         throw createURLFormatError(url);
+     }
+     assertUrlAllowed(parsedUrl);
+-    const browserSolverConfigs = resolveBrowserSolverConfigs(mcpServer);
++    if (paginationOptions.allowDestination && !paginationOptions.allowDestination(parsedUrl))
++        throw createURLSecurityPolicyError(parsedUrl.href);
++    const browserSolverConfigs = gnuPublisher(parsedUrl) ? [] : resolveBrowserSolverConfigs(mcpServer);
+     const configuredCacheKeys = browserSolverConfigs.length > 0
+         ? browserSolverConfigs.map(({ provider }) => createBrowserSolverCacheKey(provider, url))
+         : [url];
+     for (const configuredCacheKey of configuredCacheKeys) {
+         const cachedEntry = urlCache.get(configuredCacheKey);
+         if (cachedEntry) {
++            if (paginationOptions.allowDestination && (!cachedEntry.evidenceSource ||
++                !paginationOptions.allowDestination(new URL(cachedEntry.evidenceSource.publisher_url))))
++                throw createURLSecurityPolicyError(parsedUrl.href);
+             assertSafeOutput(cachedEntry.markdownContent);
+-            logMessage(mcpServer, "info", `Using cached content for URL: ${url}`);
+-            const result = applyPaginationOptions(cachedEntry.markdownContent, paginationOptions);
++            logMessage(mcpServer, "info", "Using cached page content.");
++            const result = selectReadOutput(cachedEntry.markdownContent, paginationOptions, cachedEntry.evidenceSource, true);
+             const duration = Date.now() - startTime;
+-            logMessage(mcpServer, "info", `Processed cached URL: ${url} (${result.length} chars in ${duration}ms)`);
++            logMessage(mcpServer, "info", `Processed cached page (${result.length} chars in ${duration}ms).`);
+             return result;
+         }
+     }
+     const maxContentLengthBytes = getMaxContentLengthBytes(mcpServer);
++    const article = paginationOptions.evidence && publisherArticleRoute(parsedUrl, paginationOptions);
++    if (article && (!paginationOptions.allowDestination || paginationOptions.allowDestination(article.address))) {
++        const remaining = Math.max(1, timeoutMs - (Date.now() - startTime));
++        const excerpt = await readPublisherArticle(parsedUrl, article, paginationOptions,
++            maxContentLengthBytes, remaining, signal);
++        if (excerpt !== null) return excerpt;
++    }
+     if (browserSolverConfigs.length > 0) {
++        if (paginationOptions.allowDestination)
++            throw createURLSecurityPolicyError(parsedUrl.href);
+         const preflightProxyAgent = createProxyAgent(parsedUrl.toString(), ProxyType.URL_READER);
+         const preflightDispatcher = preflightProxyAgent ?? createUrlReaderAgent();
+         const preflightHeaders = {};
+@@ -586,16 +686,34 @@
+     let current = attempt.parsedUrl;
+     try {
+         for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
++            if (attempt.paginationOptions.allowDestination && (redirects > 1 || !attempt.paginationOptions.allowDestination(current)))
++                throw createURLSecurityPolicyError(current.href);
+             const request = targetRequestOptions(attempt, current);
+-            const sizeMessage = await replaySizeMessage(attempt, current, request);
++            const gnu = gnuPublisher(current);
++            const sizeMessage = gnu ? null : await replaySizeMessage(attempt, current, request);
+             if (sizeMessage)
+                 return sizeMessage;
++            if (gnu && reserveProjectSource("gnu-license-reader", attempt.timeoutMs))
++                throw createContentError("The GNU publisher request budget is unavailable.", current.href);
+             const response = await undiciFetch(current.href, request);
++            if (gnu) {
++                if (response.headers.get("cf-mitigated") === "challenge") {
++                    pauseProjectSource("gnu-license-reader", "CAPTCHA");
++                    await cancelResponseBody(response);
++                    throw createContentError("The GNU publisher requested verification.", current.href);
++                }
++                if (response.status === 401 || response.status === 403)
++                    pauseProjectSource("gnu-license-reader", "access denied");
++                if (response.status === 429)
++                    pauseProjectSource("gnu-license-reader", "throttled", retryAfter(response.headers.get("retry-after")));
++            }
+             if (isRedirectResponse(response))
+                 void cancelResponseBody(response);
+             const next = redirectTarget(response, current, redirects);
+-            if (!next)
++            if (!next) {
++                attempt.finalUrl = current.href;
+                 return response;
++            }
+             current = next;
+         }
+         throw createContentError("Too many redirects while fetching URL.", attempt.url);
+@@ -619,6 +737,14 @@
+     throw failure;
+ }
+ async function assertSuccessfulResponse(attempt, response) {
++    const evidence = attempt.paginationOptions.evidence;
++    if (evidence && !response.ok) {
++        evidence.http_status = response.status;
++        if (response.status === 404 || response.status === 410) {
++            evidence.state = "source_not_found";
++            evidence.publisher_url = attempt.finalUrl ?? attempt.url;
++        }
++    }
+     if (response.ok)
+         return;
+     if (attempt.options.browserSolverSolution && isRetryableSolverStatus(response.status, response.headers)) {
+@@ -695,20 +821,41 @@
+         throw createContentError(`Failed to read website content: ${error.message || "Unknown error reading content"}`, attempt.url);
+     }
+ }
++function unwrapSingleCellLayouts(content) {
++    let changed = false;
++    for (const table of content.querySelectorAll("table").reverse()) {
++        if (table.querySelectorAll("caption, th").some(node => node.closest("table") === table)) continue;
++        const rows = table.querySelectorAll("tr").filter(row => row.closest("table") === table);
++        if (rows.length !== 1) continue;
++        const cells = rows[0].childNodes.filter(node => node.tagName);
++        const cell = cells[0];
++        if (cells.length !== 1 || cell.tagName !== "TD" || !cell.querySelector("h1,h2,h3,h4,h5,h6") ||
++            cell.querySelectorAll("p").length < 2) continue;
++        table.replaceWith(cell.innerHTML);
++        changed = true;
++    }
++    return changed;
++}
+ function convertText(text, type, url) {
+     assertSafeOutput(text);
+     if (type.kind === "json")
+         return renderJsonMarkdown(text, url);
+-    if (type.kind === "text")
+-        return renderFencedMarkdown(type.language, text);
+-    try {
+-        const root = parse(text);
+-        const main = root.querySelector('main, [role="main"]') ?? root.querySelector("article");
+-        if (!main)
++    if (type.kind === "text") {
++        const target = new URL(url);
++        const githubMarkdown = type.mediaType === "text/plain" && target.origin === "https://raw.githubusercontent.com" &&
++            /\.md$/iu.test(target.pathname);
++        return renderFencedMarkdown(githubMarkdown ? "markdown" : type.language, text);
++    }
++    try {
++        const root = parse(text, { lowerCaseTagName: true });
++        const main = root.querySelector('main, [role="main"]') ?? root.querySelector("article");
++        const content = main ?? root;
++        const unwrapped = unwrapSingleCellLayouts(content);
++        if (!main && !unwrapped)
+             return NodeHtmlMarkdown.translate(text);
+-        for (const node of main.querySelectorAll('nav, aside, footer, [role="navigation"], [role="complementary"], [role="banner"], [hidden]'))
++        for (const node of main?.querySelectorAll('nav, aside, footer, [role="navigation"], [role="complementary"], [role="banner"], [hidden]') ?? [])
+             node.remove();
+-        return NodeHtmlMarkdown.translate(main.toString());
++        return NodeHtmlMarkdown.translate(content.toString());
+     }
+     catch {
+         throw createConversionError(url);
+@@ -724,6 +871,30 @@
+         throw createContentError("Website returned empty content.", attempt.url);
+     return { kind: "markdown", text: convertText(read.text, type, attempt.url) };
+ }
++// Only a converted publisher body can produce an excerpt. Error messages travel
++// through the ordinary reader path without evidence metadata.
++function selectReadOutput(markdown, options, source, cached) {
++    const curlWindow = options.evidence && options.evidenceQuery && !options.section &&
++        !options.readHeadings && !options.paragraphRange && options.startChar === undefined &&
++        source?.publisher_url === "https://curl.se/docs/security.html" && curlAdvisoryWindow(options.evidenceQuery);
++    const focusedMarkdown = options.evidence && (options.evidenceQuery || options.section || options.readHeadings)
++        ? /^(`{3,})markdown\n([\s\S]+)\n\1$/u.exec(markdown)?.[2] : undefined;
++    const excerpt = curlWindow
++        ? datedCurlAdvisoryExcerpt(markdown, curlWindow, options.maxLength)
++        : applyPaginationOptions(focusedMarkdown ?? markdown, options);
++    if (!options.evidence || !source)
++        return excerpt;
++    const passage = options.evidence.requested_section_found === false ? excerpt.split('\n\n').slice(1).join('\n\n') : excerpt;
++    const missing = !passage.trim() || /^(?:No matching complete|No useful terms|Section .* not found|No headings found)/u.test(passage);
++    const date = labelledPublicationDate(passage);
++    Object.assign(options.evidence, source, {
++        state: missing ? "insufficient_evidence" : "publisher_excerpt",
++        cached,
++        publication_date: date,
++        whole_document_reviewed: false,
++    });
++    return curlWindow && !excerpt ? "No complete dated advisory rows were retrieved within the requested limits." : excerpt;
++}
+ async function completeConversion(attempt, converted) {
+     if (converted.kind === "message")
+         return converted.text;
+@@ -731,10 +902,11 @@
+         return await completeEmptyConversion(attempt);
+     attempt.signal?.throwIfAborted();
+     assertSafeOutput(converted.text);
++    const source = { publisher_url: attempt.finalUrl ?? attempt.url, retrieved_at: new Date().toISOString() };
+     if (attempt.options.shouldCacheResult)
+-        urlCache.set(attempt.options.cacheKey, converted.text);
+-    const result = applyPaginationOptions(converted.text, attempt.paginationOptions);
+-    logMessage(attempt.mcpServer, "info", `Successfully fetched and converted URL: ${attempt.url} (${result.length} chars in ${Date.now() - attempt.started}ms)`);
++        urlCache.set(attempt.options.cacheKey, converted.text, source);
++    const result = selectReadOutput(converted.text, attempt.paginationOptions, source, false);
++    logMessage(attempt.mcpServer, "info", `Fetched public page (${result.length} chars in ${Date.now() - attempt.started}ms).`);
+     return result;
+ }
+ async function completeEmptyConversion(attempt) {
+@@ -745,7 +917,7 @@
+         clearTimeout(attempt.timeoutId);
+         return await convertUrlAttempt(attempt.mcpServer, attempt.parsedUrl, remaining, attempt.paginationOptions, attempt.signal, { ...attempt.options, renderedResponse: null });
+     }
+-    logMessage(attempt.mcpServer, "warning", `Empty content after conversion: ${attempt.url}`);
++    logMessage(attempt.mcpServer, "warning", "Page conversion returned empty content.");
+     return createEmptyContentWarning(attempt.url);
+ }
+ function throwAttemptError(attempt, error) {
+@@ -755,9 +927,9 @@
+     if (error.name === "AbortError")
+         throw createTimeoutError(attempt.timeoutMs, attempt.url);
+     if (error.name === "MCPSearXNGError") {
+-        logMessage(attempt.mcpServer, "error", `Error fetching URL: ${attempt.url} - ${error.message}`);
++        logMessage(attempt.mcpServer, "error", "Public page fetch failed.");
+         throw error;
+     }
+-    logMessage(attempt.mcpServer, "error", `Unexpected error fetching URL: ${attempt.url}`, error);
++    logMessage(attempt.mcpServer, "error", "Unexpected error in public page fetch.");
+     throw createUnexpectedError(error, { url: attempt.url });
+ }
+--- a/dist/cache.js
++++ b/dist/cache.js
+@@ -59,9 +59,10 @@
+         entry.hitCount++;
+         return entry;
+     }
+-    set(url, markdownContent) {
++    set(url, markdownContent, evidenceSource) {
+         this.cache.set(url, {
+             markdownContent,
++            ...(evidenceSource && { evidenceSource }),
+             timestamp: Date.now(),
+             hitCount: 0
+         });
