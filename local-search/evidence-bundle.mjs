@@ -12,6 +12,8 @@ const paths = new Map([
     ['developer.mozilla.org', /^\/[a-z]{2,3}(?:-[a-z0-9]{2,8})?\/docs\/Web\//iu],
     ['kubernetes.io', /^\/docs\//u],
     ['specs.opencontainers.org', /^\/(?:image|runtime|distribution)-spec(?:\/[a-z0-9-]+)?\/?$/u],
+    ['github.com', /^\/nodejs\/undici\/blob\/v\d+\.\d+\.\d+\/docs\/docs\/api\/[A-Za-z0-9_-]+\.md$/u],
+    ['www.sqlite.org', /^\/[a-z0-9_]+\.html$/u],
     ['www.python-httpx.org', /^\/(?:(?:advanced\/[a-z0-9_-]+|api|async|compatibility|environment_variables|exceptions|logging|quickstart)\/)?$/u],
 ]);
 
@@ -489,31 +491,20 @@ function postgresChapterLeads(packet, chapter, intent) {
 
 async function ociPublisherEvidence(target, read, query) {
     const pending = {state: 'candidate_leads', publisher_url: target.href,
-        detail: 'The specification body could not be verified from a tagged official source.'};
+        detail: 'The specification body requires a separate publisher read.'};
     if (!query || /\bv?\d+\.\d+(?:\.\d+)?\b/iu.test(query)) return pending;
     const shell = await read(target.href, next => next.href === target.href, true);
-    const source = /This content is served from\s+\[[^\]\n]+\]\((https:\/\/github\.com\/opencontainers\/[^\s)]+)\)/iu.exec(shell?.excerpt ?? '');
-    const repository = target.pathname.split('/')[1];
-    const match = source && /^\/opencontainers\/([a-z-]+)\/blob\/(v\d+\.\d+\.\d+)\/([a-zA-Z0-9-]+\.md)$/u.exec(new URL(source[1]).pathname);
-    if (!match || match[1] !== repository) return pending;
-    const raw = `https://raw.githubusercontent.com/opencontainers/${repository}/${match[2]}/${match[3]}`;
-    const packet = await read(raw, next => next.href === raw, 'oci-source');
-    return packet?.state === 'publisher_excerpt' ? {...packet, publisher_url: target.href, retrieved_from: raw} : pending;
-}
-
-export async function ociSourceMarkdown(raw, query, remaining, signal) {
-    if (remaining < 500) return null;
-    try {
-        const {bytes} = await fetchPacedBytes('oci-spec-source', raw, 128 * 1024, Math.min(1800, remaining), signal);
-        const markdown = bytes && Buffer.from(bytes).toString('utf8');
-        if (!markdown?.trimStart().startsWith('# ')) return null;
-        const excerpt = selectEvidence(markdown, query, 3200);
-        if (!excerpt || /^(?:No matching complete|No useful terms)/u.test(excerpt)) return null;
-        return {state: 'publisher_excerpt', excerpt, publication_date: null,
-            retrieved_at: new Date().toISOString(), whole_document_reviewed: false, cached: false};
-    } catch {
-        return null;
+    if (shell.state !== 'publisher_excerpt') return shell;
+    const source = /This content is served from\s+\[[^\]\n]+\]\((https:\/\/github\.com\/opencontainers\/[^\s)]+)\)/iu.exec(shell.excerpt);
+    if (!source) {
+        return {...shell, excerpt: selectEvidence(shell.excerpt, query.replace(/^site:\S+\s*/iu, ''), 2400)};
     }
+    const repository = target.pathname.split('/')[1];
+    const sourceUrl = URL.parse(source[1]);
+    const match = sourceUrl && !sourceUrl.search && !sourceUrl.hash &&
+        /^\/opencontainers\/([a-z-]+)\/blob\/v\d+\.\d+\.\d+\/[a-zA-Z0-9-]+\.md$/u.exec(sourceUrl.pathname);
+    return {...pending, state: 'insufficient_evidence',
+        ...(match?.[1] === repository && {source_link: source[1]})};
 }
 
 export async function bundlePublisherEvidence(result, intent, remaining, read, query = '') {
@@ -530,7 +521,9 @@ export async function bundlePublisherEvidence(result, intent, remaining, read, q
                     detail: leads.length ? 'Open an original documentation section before citing its facts.'
                         : 'The current chapter did not supply a matching section link.'};
             }
-            if (result.search_assessment?.status !== 'partial_leads')
+            const knownDocumentation = (target.hostname === 'www.sqlite.org' && intent.publisher?.[1] === 'sqlite.org') ||
+                (target.hostname === 'github.com' && intent.originalTerms.includes('undici'));
+            if (result.search_assessment?.status !== 'partial_leads' || knownDocumentation)
                 return read(hit.url, next => next.origin === target.origin && allowed(next, intent.site));
         }
     }

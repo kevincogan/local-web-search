@@ -10,21 +10,23 @@ The qualified workflows are finding the official link to a known GitHub reposito
 
 Install **Python 3.10+**, **Node.js 24 with npm**, **Podman**, **Claude Code**, and the standard `patch` utility. On macOS, start your Podman VM with `podman machine start`. For a new Podman installation, run `podman machine init` once first.
 
+### 1. Set up the search app
+
 From this folder, run setup once.
 
 ```sh
 ./web-search setup
 ```
 
-Setup downloads the pinned image and packages if needed, builds the MCP server, and generates a local profile for this machine. To use a Claude account, sign in through Claude Code, then run `./web-search`.
+Setup downloads the pinned image and packages if needed, builds the MCP server, and generates a local profile for this machine.
 
-Keep `web-search`, `local-search/` and `evaluation/mcp_selection/` together. The last directory contains the pinned npm dependency, MCP build patches and Claude launcher support used at runtime. Each installation generates its own profile, build and local state.
+### 2. Choose how Claude Code connects
 
-When updating an existing checkout, close its dedicated Claude session and run `./web-search setup --rebuild`. Setup reports the backup directory and keeps your pacing database. To roll back, close the dedicated session, move the current `local-search/build-budgeted` aside, then move the saved `build-budgeted` back into `local-search/`. If the backup includes `mcp.json` and `routing.json`, park the current copies and restore both saved files alongside the build. Run `./web-search status` to check the result.
+**Claude account.** If you're already signed in to Claude Code, go to step 3. Otherwise, run `claude`, complete the sign-in, then exit back to this terminal.
 
-### Using a model gateway
+#### Using a model gateway
 
-The launcher reads gateway settings from the terminal environment. If you keep those settings in `~/.claude/settings.json`, make them available in the terminal before launching. Run the following in Bash or Zsh with the URL and model ID supplied by your provider.
+Use this path if your team gave you a gateway URL, model ID, and API key. The preview reads these settings from the terminal environment. If they're saved in `~/.claude/settings.json`, export them here before launching. Run the following in Bash or Zsh with the URL and model ID supplied by your provider.
 
 ```sh
 export ANTHROPIC_BASE_URL='YOUR_GATEWAY_URL'
@@ -33,10 +35,23 @@ printf 'API key: '
 IFS= read -rs ANTHROPIC_API_KEY
 export ANTHROPIC_API_KEY
 printf '\n'
-./web-search
 ```
 
 The prompt reads your key without displaying it or saving it in shell history. If your provider supports reasoning effort, you can also set `CLAUDE_CODE_EFFORT_LEVEL` before launching. [Claude Code environment variables](https://code.claude.com/docs/en/env-vars)
+
+### 3. Launch search
+
+Run this from the checkout in the same terminal. If Claude Code asks whether to use the custom API key you just entered, confirm it.
+
+```sh
+./web-search
+```
+
+## Updating and rolling back
+
+Keep `web-search`, `local-search/` and `evaluation/mcp_selection/` together. The last directory contains the pinned npm dependency, MCP build patches and Claude launcher support used at runtime. Each installation generates its own profile, build and local state.
+
+When updating an existing checkout, close its dedicated Claude session and run `./web-search setup --rebuild`. Setup reports the backup directory and keeps your pacing database. To roll back, close the dedicated session, move the current `local-search/build-budgeted` aside, then move the saved `build-budgeted` back into `local-search/`. If the backup includes `mcp.json` and `routing.json`, park the current copies and restore both saved files alongside the build. Run `./web-search status` to check the result.
 
 ## Using search
 

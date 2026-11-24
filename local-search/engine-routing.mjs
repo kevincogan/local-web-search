@@ -6,7 +6,7 @@ import { MCPSearXNGError } from "./error-handler.js";
 const raw = process.env.OSWS_SEARCH_POLICY;
 const policy = raw ? JSON.parse(raw) : null;
 const PUBLISHER_INTERVALS = {'python-docs-inventory': 30000, 'redhat-security-data': 30000,
-    'httpx-docs-index': 30000, 'gnu-license-reader': 30000, 'github-docs-search': 30000, 'oci-spec-source': 30000,
+    'httpx-docs-index': 30000, 'gnu-license-reader': 30000, 'github-docs-search': 30000,
     'postgres-sql-index': 30000, 'ietf-datatracker': 30000, 'openssl-advisory-index': 30000,
     'github-docs-article': 30000, 'openshift-docs-source': 30000};
 let reserveSource, readSource, pauseSource;
@@ -72,6 +72,7 @@ const PUBLISHERS = [
     [/\bpostgresql\b/iu, 'postgresql.org', 'https://www.postgresql.org/about/newsarchive/security/'],
     [/\bkubernetes\b/iu, 'kubernetes.io', 'https://kubernetes.io/docs/reference/issues-security/official-cve-feed/'],
     [/\b(?:sqlite|fts5)\b/iu, 'sqlite.org'],
+    [/\b(?:OCI|Open Container Initiative|opencontainers)\b.*\b(?:image|runtime|distribution)\b/iu, 'specs.opencontainers.org'],
     [/\bpython\b/iu, 'python.org', 'https://www.python.org/downloads/'],
     [/\bdebian\b/iu, 'security-tracker.debian.org', 'https://security-tracker.debian.org/tracker/'],
     [/\bopenssl\b/iu, 'openssl-library.org', 'https://www.openssl-library.org/news/timeline/'],
@@ -369,6 +370,11 @@ function assess(hit, intent) {
     const text = (hit.title + ' ' + (typeof hit.content === 'string' ? hit.content.slice(0, 1500) : '')).toLowerCase();
     const literal = intent.quoted.every(phrase => text.includes(phrase));
     const exact = intent.rewritten && (text.includes(intent.rewritten.toLowerCase()) || hit.url.toLowerCase().includes('/' + intent.rewritten.toLowerCase()));
+    // Retain a versioned Undici API page for the requested symbol even when
+    // the provider supplies only a title. A symbol match still needs a read.
+    const api = target.hostname === 'github.com' && /^\/nodejs\/undici\/blob\/v\d+\.\d+\.\d+\/docs\/docs\/api\/([a-z0-9_-]+)\.md$/iu.exec(target.pathname);
+    const undiciLead = api && words.has(api[1].toLowerCase()) &&
+        intent.originalTerms.includes('undici') && intent.originalTerms.includes(api[1].toLowerCase());
     const date = typeof hit.publishedDate === 'string' ? Date.parse(hit.publishedDate) : NaN;
     const recent = intent.dateWindow && date >= intent.dateWindow[0] && date <= intent.dateWindow[1];
     const rank = coverage + matched.filter(word => titleMatches.has(word)).length / Math.max(1, intent.originalTerms.length)
@@ -382,9 +388,8 @@ function assess(hit, intent) {
     const documentationPath = /\/(?:doc|docs|reference)\//iu.test(target.pathname) && terms(target.pathname);
     const productMatch = documentationPath && terms(target.hostname.replace(/^www\./iu, '').split('.')[0])
         .some(word => intent.originalTerms.includes(word) && titleMatches.has(word));
-    const documentationLead = !relevant && literal && productMatch &&
-        ['general', 'documentation'].includes(intent.category) &&
-        matched.some(word => documentationPath.includes(word));
+    const documentationLead = !relevant && literal && ['general', 'documentation'].includes(intent.category) &&
+        (undiciLead || productMatch && matched.some(word => documentationPath.includes(word)));
     return {hit, rank, relevant, sufficient, documentationLead};
 }
 

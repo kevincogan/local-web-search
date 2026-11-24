@@ -206,6 +206,7 @@ export function selectEvidence(markdown, query, limit) {
     if (markdown.length <= limit) return markdown;
     const phrase = query.match(/`([^`]{2,80})`/g)?.map(s => s.slice(1, -1).toLowerCase()) ?? [];
     const literals = [...new Set([...phrase,
+        ...Array.from(query.matchAll(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/giu), match => match[0].toLowerCase()),
         ...Array.from(query.matchAll(/\b[A-Z][A-Z0-9_]*(?: [A-Z][A-Z0-9_]*)+\b/g), match => match[0].toLowerCase())])];
     const queryTerms = new Set(words(query));
     if (/\bsecurity (?:fix(?:es)?|releases?|advisor(?:y|ies)|updates?)\b/iu.test(query)) queryTerms.add('cve');

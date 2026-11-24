@@ -152,7 +152,7 @@
 -import { performWebSearch } from "./search.js";
 +import { getSearchTimeoutMs, performWebSearch } from "./search.js";
 +import { classifySearch } from "./engine-routing.mjs";
-+import { advisoryIndex, bundlePublisherEvidence, datedAdvisoryLeads, exactTechnicalRecord, githubDocsLeads, httpxDocsLeads, ietfLeads, ociSourceMarkdown, postgresSqlLead, pythonInventoryLead } from "./evidence-bundle.mjs";
++import { advisoryIndex, bundlePublisherEvidence, datedAdvisoryLeads, exactTechnicalRecord, githubDocsLeads, httpxDocsLeads, ietfLeads, postgresSqlLead, pythonInventoryLead } from "./evidence-bundle.mjs";
  import { HF_CATALOG_TOOL, validCatalogArgs, readHuggingFaceCatalog } from "./huggingface-catalog.mjs";
  import { performSearchSuggestions } from "./suggestions.js";
  import { checkStartupCapabilities, fetchInstanceInfo } from "./instance-info.js";
@@ -168,7 +168,7 @@
      // Convert empty strings to undefined for optional string parameters
      if (urlArgs.section === "")
          urlArgs.section = undefined;
-@@ -149,10 +156,127 @@
+@@ -149,10 +156,124 @@
          throw new ProtocolError(ProtocolErrorCode.InvalidParams, sanitizeDiagnosticText(`Unknown tool: ${name}`));
      return definition.validate(args) ? undefined : definition.invalidArguments;
  }
@@ -181,8 +181,14 @@
 +        publisher_index: leads[0].source_index, publisher_pages_verified: false,
 +    }, publisher_evidence: {
 +        state: "candidate_leads", publisher_url: leads[0].source_index,
-+        detail: "The publisher index identifies documentation sections. Open the original record before citing its facts.",
++        detail: data.search_assessment?.publisher_read_used ? "The available read located a documentation section. Its contents are unverified." : "The publisher index identifies documentation sections. Open the original record before citing its facts.",
 +    } }));
++}
++function markPublisherRead(assessment, state) {
++    const result = { ...assessment, evidence_state: state, publisher_pages_verified: state === "publisher_excerpt",
++        publisher_read_used: true };
++    delete result.next_engine;
++    return result;
 +}
 +async function executeWebSearch(mcpServer, args, signal) {
      if (!isSearXNGWebSearchArgs(args))
@@ -201,7 +207,6 @@
 +        !args.time_range && !args.refresh && (args.min_score ?? 0) <= 1 && (args.pageno ?? 1) === 1 && (args.pages ?? 1) === 1;
 +    const englishCatalogue = allowCatalogue && (!args.language || /^all$|^en(?:-|$)/iu.test(args.language));
 +    const direct = allowCatalogue && exactTechnicalRecord(args.query, intent);
-+    let directFailure;
 +    if (direct) {
 +        const read = await executeUrlRead(mcpServer, { url: direct.url, evidenceQuery: args.query.slice(0, 360),
 +            responseFormat: "evidence", maxLength: 2400 }, signal, {
@@ -209,13 +214,11 @@
 +            timeout: Math.max(1, Math.min(2500, Math.floor(deadline - performance.now()))),
 +        });
 +        const packet = JSON.parse(read.content[0].text);
-+        if (packet.state === "publisher_excerpt") {
-+            const results = [{ ...direct, score: 1, engines: [], content: "" }];
-+            return textToolResult(JSON.stringify({ results, engine_attempts: [], publisher_evidence: packet }));
-+        }
-+        directFailure = packet;
++        const results = packet.state === "publisher_excerpt" ? [{ ...direct, score: 1, engines: [], content: "" }] : [];
++        return textToolResult(JSON.stringify({ results, engine_attempts: [],
++            search_assessment: markPublisherRead({ intent: intent.category }, packet.state), publisher_evidence: packet }));
 +    }
-+    if (englishCatalogue && !directFailure) {
++    if (englishCatalogue) {
 +        const standards = await ietfLeads(args.query, intent, Math.floor(deadline - performance.now()), signal);
 +        if (standards.length)
 +            return documentationLeads({ results: [], engine_attempts: [], search_assessment: { intent: intent.category } }, standards, args.num_results ?? 5);
@@ -233,10 +236,6 @@
 +    if (!bundled)
 +        return textToolResult(result);
 +    const data = JSON.parse(result);
-+    if (directFailure) {
-+        return textToolResult(JSON.stringify({ ...data, direct_record: directFailure,
-+            publisher_evidence: data.results.length ? { state: "candidate_leads", detail: "Search leads need an original record read." } : directFailure }));
-+    }
 +    const remaining = Math.floor(deadline - performance.now());
 +    if (englishCatalogue && data.search_assessment?.intent === "known-site" && data.search_assessment.status !== "relevant_leads") {
 +        const symbol = await pythonInventoryLead(args.query, intent, remaining, signal);
@@ -244,6 +243,7 @@
 +    }
 +    const index = allowCatalogue && advisoryIndex(intent, args.query);
 +    if (index && remaining >= 500 && data.search_assessment?.status !== "relevant_leads") {
++        const readUsed = !index.fetchLeads;
 +        const packet = index.fetchLeads ? await index.fetchLeads(remaining, signal)
 +            : JSON.parse((await executeUrlRead(mcpServer, { url: index.url, responseFormat: "evidence", maxLength: 12000 }, signal, {
 +            allowDestination: url => url.href === index.url,
@@ -254,8 +254,8 @@
 +            if (excerpt) {
 +                const release = { url: index.url, title: index.title, content: "", engines: [], score: 1 };
 +                return textToolResult(JSON.stringify({ ...data, results: [release, ...data.results.filter(hit => hit.url !== index.url)].slice(0, args.num_results ?? 5),
-+                    search_assessment: { ...data.search_assessment, status: "relevant_leads", evidence_state: "publisher_excerpt",
-+                        publisher_pages_verified: true, publication_date_verified: false },
++                    search_assessment: markPublisherRead({ ...data.search_assessment, status: "relevant_leads",
++                        publication_date_verified: false }, "publisher_excerpt"),
 +                    publisher_evidence: { ...packet, excerpt } }));
 +            }
 +        }
@@ -263,42 +263,39 @@
 +        if (leads.length) {
 +            const seen = new Set(leads.map(lead => lead.url));
 +            const results = [...leads, ...data.results.filter(hit => !seen.has(hit.url))].slice(0, args.num_results ?? 5);
-+            return textToolResult(JSON.stringify({ ...data, results, search_assessment: {
-+                ...data.search_assessment,
-+                intent: "fresh",
-+                status: "relevant_leads",
-+                evidence_state: "candidate_leads",
-+                publisher_index: index.url,
-+                publisher_pages_verified: false,
-+                publication_date_verified: false,
-+            }, publisher_evidence: {
-+                state: "candidate_leads",
-+                publisher_url: index.url,
-+                detail: index.leadDetail ?? "These dates are from the publisher index. Open an original record before citing its facts.",
-+            } }));
++            const assessment = { ...data.search_assessment, intent: "fresh", status: "relevant_leads",
++                evidence_state: "candidate_leads", publisher_index: index.url, publisher_pages_verified: false,
++                publication_date_verified: false };
++            const detail = readUsed ? "The available read located leads. Their individual contents are unverified."
++                : index.leadDetail ?? "These dates are from the publisher index. Open an original record before citing its facts.";
++            return textToolResult(JSON.stringify({ ...data, results,
++                search_assessment: readUsed ? markPublisherRead(assessment, "candidate_leads") : assessment,
++                publisher_evidence: { state: "candidate_leads", publisher_url: index.url, detail } }));
 +        }
-+        return textToolResult(JSON.stringify({ ...data, publisher_evidence: {
-+            state: packet.state === "publisher_excerpt" ? "insufficient_evidence" : packet.state,
-+            publisher_url: index.url,
-+            detail: "The bounded index read did not provide a matching publisher record.",
-+        } }));
++        const state = packet.state === "publisher_excerpt" ? "insufficient_evidence" : packet.state;
++        return textToolResult(JSON.stringify({ ...data,
++            search_assessment: readUsed ? markPublisherRead(data.search_assessment, state) : data.search_assessment,
++            publisher_evidence: { state, publisher_url: index.url,
++                detail: "The bounded index read did not provide a matching publisher record." } }));
 +    }
++    let publisherReadUsed = false;
 +    const publisher = await bundlePublisherEvidence(data, intent, remaining, async (url, allowDestination, readContents) => {
++        publisherReadUsed = true;
 +        const readTime = Math.floor(deadline - performance.now());
-+        if (readContents === "oci-source")
-+            return ociSourceMarkdown(url, args.query, readTime, signal);
 +        const read = await executeUrlRead(mcpServer, {
 +            url, responseFormat: "evidence", maxLength: readContents ? 10000 : 2400,
 +            ...(readContents ? {} : { evidenceQuery: (intent.site ? args.query.trim().replace(/^site:\S+\s*/iu, "") : args.query).slice(0, 360) }),
 +        }, signal, { allowDestination, timeout: Math.max(1, readTime) });
 +        return JSON.parse(read.content[0].text);
 +    }, englishCatalogue ? args.query : "");
++    if (publisherReadUsed)
++        data.search_assessment = markPublisherRead(data.search_assessment, publisher.state);
 +    if (publisher.leads?.length) return documentationLeads(data, publisher.leads, args.num_results ?? 5);
 +    return textToolResult(JSON.stringify({ ...data, publisher_evidence: publisher }));
  }
  async function executeSuggestions(mcpServer, args) {
      if (!isSearXNGSearchSuggestionsArgs(args))
-@@ -165,22 +262,47 @@
+@@ -165,22 +259,47 @@
          throw new Error("Invalid arguments for instance info");
      return textToolResult(await fetchInstanceInfo(mcpServer, args.includeEngines, args.includeDisabled, args.category, args.refresh));
  }
@@ -356,7 +353,7 @@
  }
  const TOOL_DEFINITIONS = {
      huggingface_catalog: {
-@@ -197,10 +326,52 @@
+@@ -197,10 +323,52 @@
          execute: executeUrlRead,
      },
  };
